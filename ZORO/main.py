@@ -38,6 +38,12 @@ import requests
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz
 
+
+SCRAPINGBEE_API_KEY = "64MS0CGV3U2L4FZF3SHCEYKE56LS6APVEOD9PQ6SW307XYMY11GNWC0NPMS6S0XFZFMQZ9G8PD7NFBCL"
+SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
+USE_SCRAPINGBEE = True  # set to False if you want to revert to requests
+
+
 # Optional dependency is imported lazily in ``fetch_html_with_playwright``.
 
 # ---------------------------------------------------------------------------
@@ -47,21 +53,34 @@ BASE_URL = "https://www.zoro.com"
 SEARCH_URL_TEMPLATE = BASE_URL + "/search?q={query}"
 IMAGE_DIR_NAME = "zoro_images"
 MAX_RESULTS_PER_ITEM = 5
-FUZZY_MATCH_THRESHOLD = 60
+FUZZY_MATCH_THRESHOLD = 50
 REQUEST_TIMEOUT = 20
+PLAYWRIGHT_USER_DATA_DIR = Path("zoro_profile")
+PLAYWRIGHT_VIEWPORT = {"width": 1366, "height": 768}
 PLAYWRIGHT_WAIT_SELECTORS = [
-    "[data-testid='plp-product-card']",
-    "[data-testid='plp-product-card-container']",
-    "article[data-testid='product-card']",
-    "div[data-testid='product-card']",
-    "a[data-testid='product-title']",
+    "[data-test='productCard']",
+    "[data-test='productCardTitle']",
 ]
+PLAYWRIGHT_LAUNCH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-infobars",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+DEBUG_MODE = False
 
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif," 
+        "image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
@@ -92,6 +111,19 @@ def slugify(value: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_")
     return value or "item"
+
+
+def best_score(query: str, candidate: str) -> int:
+    """Return the strongest fuzzy score between two strings."""
+
+    if not query or not candidate:
+        return 0
+
+    return max(
+        fuzz.token_set_ratio(query, candidate),
+        fuzz.token_sort_ratio(query, candidate),
+        fuzz.partial_ratio(query, candidate),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +159,103 @@ def read_excel_items(excel_path: Path) -> List[str]:
 # Networking helpers
 # ---------------------------------------------------------------------------
 
+_playwright_manager = None
+_playwright_context = None
+_playwright_page = None
+_playwright_timeout_error = None
+
+
+def _ensure_playwright_page():
+    """Lazily initialise and return a persistent Playwright page."""
+
+    global _playwright_manager, _playwright_context, _playwright_page, _playwright_timeout_error
+
+    if _playwright_page is not None:
+        return _playwright_page
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    except ImportError:
+        return None
+
+    try:
+        PLAYWRIGHT_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Failure to create the directory should not abort scraping outright.
+        pass
+
+    try:
+        _playwright_manager = sync_playwright().start()
+        _playwright_context = _playwright_manager.chromium.launch_persistent_context(
+            user_data_dir=str(PLAYWRIGHT_USER_DATA_DIR),
+            headless=False,
+            args=PLAYWRIGHT_LAUNCH_ARGS,
+        )
+        _playwright_context.set_default_timeout(REQUEST_TIMEOUT * 1000)
+
+        _playwright_page = _playwright_context.new_page()
+        _playwright_page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        _playwright_page.set_user_agent(DEFAULT_HEADERS["User-Agent"])
+        _playwright_page.set_viewport_size(PLAYWRIGHT_VIEWPORT)
+        _playwright_page.set_extra_http_headers(
+            {
+                "Accept": DEFAULT_HEADERS.get("Accept", "*/*"),
+                "Accept-Encoding": DEFAULT_HEADERS.get("Accept-Encoding", "gzip, deflate, br"),
+                "Accept-Language": DEFAULT_HEADERS.get("Accept-Language", "en-US,en;q=0.9"),
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+
+        _playwright_timeout_error = PlaywrightTimeoutError
+        return _playwright_page
+    except Exception:
+        if _playwright_context is not None:
+            try:
+                _playwright_context.close()
+            except Exception:
+                pass
+        if _playwright_manager is not None:
+            try:
+                _playwright_manager.stop()
+            except Exception:
+                pass
+        _playwright_manager = None
+        _playwright_context = None
+        _playwright_page = None
+        _playwright_timeout_error = None
+        return None
+
+
+def shutdown_playwright() -> None:
+    """Close any persistent Playwright resources."""
+
+    global _playwright_manager, _playwright_context, _playwright_page, _playwright_timeout_error
+
+    if _playwright_page is not None:
+        try:
+            _playwright_page.close()
+        except Exception:
+            pass
+    if _playwright_context is not None:
+        try:
+            _playwright_context.close()
+        except Exception:
+            pass
+    if _playwright_manager is not None:
+        try:
+            _playwright_manager.stop()
+        except Exception:
+            pass
+
+    _playwright_manager = None
+    _playwright_context = None
+    _playwright_page = None
+    _playwright_timeout_error = None
+
 def fetch_html_with_requests(url: str, session: requests.Session) -> Optional[str]:
     """Fetch HTML content using the requests library."""
 
@@ -139,38 +268,87 @@ def fetch_html_with_requests(url: str, session: requests.Session) -> Optional[st
 
 
 def fetch_html_with_playwright(url: str) -> Optional[str]:
-    """Fetch page HTML using Playwright in headless mode.
+    """Fetch page HTML using a persistent Playwright browser context."""
 
-    Returns ``None`` if Playwright is unavailable or the page could not be
-    rendered successfully.
-    """
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+    page = _ensure_playwright_page()
+    if page is None or _playwright_timeout_error is None:
         return None
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000)
+    html: Optional[str] = None
+    max_attempts = 6
+    cloudflare_logged = False
 
-            for selector in PLAYWRIGHT_WAIT_SELECTORS:
-                try:
-                    page.wait_for_selector(selector, timeout=5000, state="visible")
-                    break
-                except Exception:
-                    continue
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if attempt == 1:
+                page.goto(url, wait_until="domcontentloaded")
             else:
-                # If no selector matched, allow some time for dynamic content.
-                page.wait_for_timeout(2000)
+                page.reload(wait_until="domcontentloaded")
+        except Exception:
+            continue
 
+        # Allow Cloudflare to complete by idling like a real user.
+        wait_duration = random.uniform(8, 15)
+        time.sleep(wait_duration)
+
+        try:
             html = page.content()
-            browser.close()
-            return html
-    except Exception:
-        return None
+        except Exception:
+            html = None
+
+        challenge_present = False
+        if html:
+            lowered = html.lower()
+            if "data-cfasync" in lowered or "__cf_chl_jschl_tk__" in lowered:
+                challenge_present = True
+
+        if challenge_present:
+            print(f"  * Cloudflare challenge detected, waiting… (attempt {attempt})")
+            time.sleep(10)
+            html = None
+            continue
+
+        product_card_visible = False
+        product_title_visible = False
+
+        try:
+            page.wait_for_selector("[data-test='productCard']", state="visible", timeout=8000)
+            product_card_visible = True
+        except _playwright_timeout_error:
+            try:
+                page.wait_for_selector("[data-test='productCardTitle']", state="visible", timeout=5000)
+                product_title_visible = True
+            except _playwright_timeout_error:
+                pass
+
+        try:
+            html = page.content()
+        except Exception:
+            pass
+
+        html_contains_cards = False
+        if html and "[data-test=\"productCard\"]" in html:
+            html_contains_cards = True
+
+        print(
+            f"  * {page.url} - product cards detected: {'yes' if (product_card_visible or product_title_visible or html_contains_cards) else 'no'} (attempt {attempt})"
+        )
+
+        if (product_card_visible or html_contains_cards) and not cloudflare_logged:
+            print("  * ✅ Passed Cloudflare challenge.")
+            cloudflare_logged = True
+
+        if product_card_visible or product_title_visible or html_contains_cards:
+            break
+
+        time.sleep(3)
+
+    if DEBUG_MODE:
+        preview = (html or "")[:500]
+        print("  * Playwright HTML preview (first 500 chars):")
+        print(preview)
+
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -186,64 +364,84 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
 
     soup = BeautifulSoup(html, "html.parser")
 
-    selectors = [
-        "[data-testid='plp-product-card']",
-        "[data-testid='plp-product-card-container']",
-        "article[data-testid='product-card']",
-        "div[data-testid='product-card']",
-        "li[class*='ProductCard']",
-    ]
-
-    cards: List = []
-    for selector in selectors:
-        matches = soup.select(selector)
-        if matches:
-            cards = matches
-            break
+    card_source = "data-test-productCard"
+    cards = soup.select("a[data-test='productCard']")
+    if cards:
+        print(f"  * Found {len(cards)} product cards via [data-test='productCard'] selector.")
 
     if not cards:
-        # Fall back to a more generic search for anchor tags representing products.
+        seen_ids = set()
+        fallback_cards: List = []
+        for title_node in soup.select("[data-test='productCardTitle']"):
+            anchor = title_node.find_parent("a")
+            if anchor and id(anchor) not in seen_ids:
+                seen_ids.add(id(anchor))
+                fallback_cards.append(anchor)
+        if fallback_cards:
+            cards = fallback_cards
+            card_source = "productCardTitle"
+            print(
+                f"  * Found {len(cards)} product cards via [data-test='productCardTitle'] fallback."
+            )
+
+    if not cards:
         cards = soup.select("a[href*='/i/']")
+        if cards:
+            card_source = "generic-anchor"
+            print(
+                f"  * Falling back to generic product anchors (found {len(cards)} matches)."
+            )
+    if not cards:
+        print("  * No product cards detected after applying all selectors.")
+        card_source = "none"
 
     results: List[dict] = []
     for card in cards:
         try:
-            title_tag = card.select_one(
-                "a[data-testid='product-title'], a[data-za-detail='ProductName'], "
-                "a[href*='/i/'], h2, h3"
+            title_tag = card.select_one("[data-test='productCardTitle']") or card.select_one(
+                "[data-test='product-title']"
             )
-            title = title_tag.get_text(strip=True) if title_tag else ""
+            title = ""
+            if title_tag:
+                title = title_tag.get_text(" ", strip=True)
+            if not title:
+                title = card.get("aria-label", "")
+            if not title:
+                title = card.get_text(" ", strip=True)
+            if not title:
+                nested_tag = card.select_one("div,span,h2,h3")
+                if nested_tag:
+                    title = nested_tag.get_text(" ", strip=True)
 
-            link_tag = card.select_one("a[data-testid='product-title']") or card.select_one(
-                "a[href*='/i/']"
-            )
-            url = ""
-            if link_tag:
-                href = link_tag.get("href", "")
-                url = href if href.startswith("http") else BASE_URL + href
+            href = card.get("href", "")
+            url = href if href.startswith("http") else f"{BASE_URL}{href}" if href else ""
 
-            price_tag = (
-                card.select_one("[data-testid='price'] span")
-                or card.select_one("[data-testid='price']")
-                or card.select_one("[data-testid='product-price']")
-                or card.select_one("div[class*='Price'] span")
-                or card.select_one("span[class*='price']")
+            price_tag = card.select_one("[data-test='productCardPrice']") or card.select_one(
+                "[data-test='price']"
             )
             price = price_tag.get_text(strip=True) if price_tag else ""
 
-            sku_tag = card.find(lambda tag: tag.name in {"span", "div"} and "SKU" in tag.get_text())
+            sku_tag = card.find(
+                lambda tag: tag.name in {"span", "div"}
+                and tag.get_text(strip=True).upper().startswith("SKU")
+            )
             sku_text = sku_tag.get_text(strip=True) if sku_tag else ""
             sku = sku_text.replace("SKU", "").replace("#", "").strip()
 
-            brand_tag = card.select_one("[data-testid='brand-name']") or card.select_one(
-                "[data-testid='product-brand']"
+            brand_tag = card.select_one("[data-test='product-brand']") or card.select_one(
+                "[data-test='brand-name']"
             )
             brand = brand_tag.get_text(strip=True) if brand_tag else ""
 
-            image_tag = card.select_one("img[data-testid='product-image']") or card.select_one("img")
+            image_tag = card.select_one("img")
             image_url = ""
             if image_tag:
-                image_url = image_tag.get("src") or image_tag.get("data-src") or ""
+                image_url = (
+                    image_tag.get("src")
+                    or image_tag.get("data-src")
+                    or image_tag.get("data-original")
+                    or ""
+                )
 
             if not title and not url:
                 continue
@@ -256,6 +454,7 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
                     "sku": sku,
                     "brand": brand,
                     "image_url": image_url,
+                    "source": card_source,
                 }
             )
         except Exception:
@@ -290,6 +489,19 @@ def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult
         print("  ! No product cards detected on the page.")
         return []
 
+    if DEBUG_MODE:
+        generic_candidates = [raw for raw in raw_results if raw.get("source") == "generic-anchor"]
+        if generic_candidates:
+            debug_scores = []
+            for raw in generic_candidates:
+                title = raw.get("title", "")
+                score = best_score(item_name, title)
+                debug_scores.append((score, title, raw.get("url", "")))
+            debug_scores.sort(key=lambda entry: entry[0], reverse=True)
+            print("  * Debug: top generic anchor candidates")
+            for idx, (score, title, url) in enumerate(debug_scores[:20], start=1):
+                print(f"    {idx:02d}. score={score:>3} title={title[:120]} url={url}")
+
     results: List[ProductResult] = []
     for raw in raw_results:
         title = raw.get("title", "")
@@ -302,7 +514,7 @@ def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult
         if not title and not url:
             continue
 
-        match_score = fuzz.token_set_ratio(item_name, title)
+        match_score = best_score(item_name, title)
         if match_score < FUZZY_MATCH_THRESHOLD:
             continue
 
@@ -411,46 +623,63 @@ def main() -> None:
 
     all_results: List[ProductResult] = []
 
-    for item_name in items:
-        print(f"Searching for: {item_name}...")
-        results = search_zoro(item_name, session)
-
-        if not results:
-            all_results.append(
-                ProductResult(
-                    search_term=item_name,
-                    title="Not found",
-                    url="",
-                    price="",
-                    sku="",
-                    brand="",
-                    image_url="",
-                    image_path="",
-                    match_score=0,
-                )
-            )
-            print(f"No results found for '{item_name}'.")
-        else:
-            for idx, product in enumerate(results, start=1):
-                base_name_parts = [slugify(item_name), str(idx)]
-                if product.sku:
-                    base_name_parts.insert(1, slugify(product.sku))
-                base_name = "_".join(part for part in base_name_parts if part)
-
-                image_path = download_image(product.image_url, image_dir, base_name, session)
-                product.image_path = image_path
-                all_results.append(product)
-                print(f"  -> Found: {product.title} (Score: {product.match_score})")
-
-        # Random delay between requests to avoid hammering the server.
-        delay = random.uniform(1, 3)
-        time.sleep(delay)
+    consecutive_failures = 0
 
     try:
-        save_to_excel(all_results, output_path)
-        print(f"Saved results to {output_path}")
-    except Exception as exc:
-        print(f"Failed to save results: {exc}")
+        for item_name in items:
+            print(f"Searching for: {item_name}...")
+            results = search_zoro(item_name, session)
+
+            if not results:
+                all_results.append(
+                    ProductResult(
+                        search_term=item_name,
+                        title="Not found",
+                        url="",
+                        price="",
+                        sku="",
+                        brand="",
+                        image_url="",
+                        image_path="",
+                        match_score=0,
+                    )
+                )
+                print(f"No results found for '{item_name}'.")
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+                for idx, product in enumerate(results, start=1):
+                    base_name_parts = [slugify(item_name), str(idx)]
+                    if product.sku:
+                        base_name_parts.insert(1, slugify(product.sku))
+                    base_name = "_".join(part for part in base_name_parts if part)
+
+                    image_path = download_image(
+                        product.image_url, image_dir, base_name, session
+                    )
+                    product.image_path = image_path
+                    all_results.append(product)
+                    print(f"  -> Found: {product.title} (Score: {product.match_score})")
+
+                    if product.image_url:
+                        time.sleep(random.uniform(2, 4))
+
+            if consecutive_failures >= 3:
+                print("  ! Encountered 3 consecutive failed searches. Backing off for 60 seconds.")
+                time.sleep(60)
+                consecutive_failures = 0
+
+            # Random delay between requests to avoid hammering the server.
+            delay = random.uniform(4, 9)
+            time.sleep(delay)
+
+        try:
+            save_to_excel(all_results, output_path)
+            print(f"Saved results to {output_path}")
+        except Exception as exc:
+            print(f"Failed to save results: {exc}")
+    finally:
+        shutdown_playwright()
 
 
 if __name__ == "__main__":
