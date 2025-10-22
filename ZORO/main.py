@@ -49,6 +49,13 @@ IMAGE_DIR_NAME = "zoro_images"
 MAX_RESULTS_PER_ITEM = 5
 FUZZY_MATCH_THRESHOLD = 60
 REQUEST_TIMEOUT = 20
+PLAYWRIGHT_WAIT_SELECTORS = [
+    "[data-testid='plp-product-card']",
+    "[data-testid='plp-product-card-container']",
+    "article[data-testid='product-card']",
+    "div[data-testid='product-card']",
+    "a[data-testid='product-title']",
+]
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -147,7 +154,18 @@ def fetch_html_with_playwright(url: str) -> Optional[str]:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            page.goto(url, wait_until="networkidle", timeout=REQUEST_TIMEOUT * 1000)
+            page.goto(url, wait_until="domcontentloaded", timeout=REQUEST_TIMEOUT * 1000)
+
+            for selector in PLAYWRIGHT_WAIT_SELECTORS:
+                try:
+                    page.wait_for_selector(selector, timeout=5000, state="visible")
+                    break
+                except Exception:
+                    continue
+            else:
+                # If no selector matched, allow some time for dynamic content.
+                page.wait_for_timeout(2000)
+
             html = page.content()
             browser.close()
             return html
@@ -172,9 +190,8 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
         "[data-testid='plp-product-card']",
         "[data-testid='plp-product-card-container']",
         "article[data-testid='product-card']",
-        "article[data-test='product-card']",
-        "div[class*='ProductCardstyles__ProductCardContainer']",
         "div[data-testid='product-card']",
+        "li[class*='ProductCard']",
     ]
 
     cards: List = []
@@ -191,29 +208,42 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
     results: List[dict] = []
     for card in cards:
         try:
-            title_tag = card.select_one("a, h2, h3")
+            title_tag = card.select_one(
+                "a[data-testid='product-title'], a[data-za-detail='ProductName'], "
+                "a[href*='/i/'], h2, h3"
+            )
             title = title_tag.get_text(strip=True) if title_tag else ""
 
-            link_tag = card.select_one("a[href]")
+            link_tag = card.select_one("a[data-testid='product-title']") or card.select_one(
+                "a[href*='/i/']"
+            )
             url = ""
             if link_tag:
                 href = link_tag.get("href", "")
                 url = href if href.startswith("http") else BASE_URL + href
 
-            price_tag = card.select_one("[data-testid='price'], .price, .Price, span")
+            price_tag = (
+                card.select_one("[data-testid='price'] span")
+                or card.select_one("[data-testid='price']")
+                or card.select_one("[data-testid='product-price']")
+                or card.select_one("div[class*='Price'] span")
+                or card.select_one("span[class*='price']")
+            )
             price = price_tag.get_text(strip=True) if price_tag else ""
 
             sku_tag = card.find(lambda tag: tag.name in {"span", "div"} and "SKU" in tag.get_text())
             sku_text = sku_tag.get_text(strip=True) if sku_tag else ""
             sku = sku_text.replace("SKU", "").replace("#", "").strip()
 
-            brand_tag = card.select_one("[data-testid='brand-name'], .brand, .Brand")
+            brand_tag = card.select_one("[data-testid='brand-name']") or card.select_one(
+                "[data-testid='product-brand']"
+            )
             brand = brand_tag.get_text(strip=True) if brand_tag else ""
 
-            image_tag = card.select_one("img")
-            image_url = image_tag.get("src") if image_tag else ""
-            if image_tag and not image_url:
-                image_url = image_tag.get("data-src", "")
+            image_tag = card.select_one("img[data-testid='product-image']") or card.select_one("img")
+            image_url = ""
+            if image_tag:
+                image_url = image_tag.get("src") or image_tag.get("data-src") or ""
 
             if not title and not url:
                 continue
@@ -245,15 +275,20 @@ def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult
     """Search Zoro for a given item and return the best-matching products."""
 
     query_url = SEARCH_URL_TEMPLATE.format(query=requests.utils.quote(item_name))
-    html = fetch_html_with_requests(query_url, session)
 
-    if html is None:
-        html = fetch_html_with_playwright(query_url)
+    html = fetch_html_with_playwright(query_url)
+    if not html:
+        print("  ! Playwright rendering failed; trying static HTML fetch.")
+        html = fetch_html_with_requests(query_url, session)
 
     if not html:
+        print(f"  ! Failed to retrieve results for '{item_name}'.")
         return []
 
     raw_results = parse_product_data(html, max_results=MAX_RESULTS_PER_ITEM * 2)
+    if not raw_results:
+        print("  ! No product cards detected on the page.")
+        return []
 
     results: List[ProductResult] = []
     for raw in raw_results:
@@ -287,6 +322,9 @@ def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult
 
         if len(results) >= MAX_RESULTS_PER_ITEM:
             break
+
+    if not results:
+        print("  ! No close matches met the fuzzy match threshold.")
 
     return results
 
