@@ -1,10 +1,10 @@
-"""Zoro Product Scraper — ScrapingBee Edition
+"""Zoro Product Scraper — ScrapingBee + Playwright + Requests Hybrid
 
-This script reads product names from an Excel spreadsheet (``test_items.xlsx``),
-searches Zoro.com for matching products, and exports up to the first five product
-results, including images and pricing, to ``zoro_results.xlsx``.
-
-Now powered by ScrapingBee for Cloudflare-safe JS rendering.
+Now includes:
+✅ ScrapingBee for Cloudflare-safe scraping
+✅ Playwright fallback if ScrapingBee fails
+✅ Requests backup for static content
+✅ Smarter fuzzy matching, normalization, and /i/ link fallbacks
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from rapidfuzz import fuzz
 # ---------------------------------------------------------------------------
 SCRAPINGBEE_API_KEY = "64MS0CGV3U2L4FZF3SHCEYKE56LS6APVEOD9PQ6SW307XYMY11GNWC0NPMS6S0XFZFMQZ9G8PD7NFBCL"
 SCRAPINGBEE_ENDPOINT = "https://app.scrapingbee.com/api/v1/"
-USE_SCRAPINGBEE = True  # Toggle True to use ScrapingBee instead of Playwright
+USE_SCRAPINGBEE = True
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -32,7 +32,7 @@ BASE_URL = "https://www.zoro.com"
 SEARCH_URL_TEMPLATE = BASE_URL + "/search?q={query}"
 IMAGE_DIR_NAME = "zoro_images"
 MAX_RESULTS_PER_ITEM = 5
-FUZZY_MATCH_THRESHOLD = 50
+FUZZY_MATCH_THRESHOLD = 35
 REQUEST_TIMEOUT = 25
 DEBUG_MODE = False
 
@@ -60,7 +60,7 @@ class ProductResult:
     match_score: int
 
 # ---------------------------------------------------------------------------
-# Utility helpers
+# Helpers
 # ---------------------------------------------------------------------------
 def slugify(value: str) -> str:
     value = value.strip().lower()
@@ -68,13 +68,19 @@ def slugify(value: str) -> str:
     value = re.sub(r"_+", "_", value).strip("_")
     return value or "item"
 
+def normalize_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return s.strip()
+
 def best_score(query: str, candidate: str) -> int:
     if not query or not candidate:
         return 0
+    q, c = normalize_text(query), normalize_text(candidate)
     return max(
-        fuzz.token_set_ratio(query, candidate),
-        fuzz.token_sort_ratio(query, candidate),
-        fuzz.partial_ratio(query, candidate),
+        fuzz.token_set_ratio(q, c),
+        fuzz.token_sort_ratio(q, c),
+        fuzz.partial_ratio(q, c),
     )
 
 # ---------------------------------------------------------------------------
@@ -101,7 +107,6 @@ def read_excel_items(excel_path: Path) -> List[str]:
 # Networking helpers
 # ---------------------------------------------------------------------------
 def fetch_html_with_scrapingbee(url: str) -> Optional[str]:
-    """Fetch rendered HTML through ScrapingBee API (Cloudflare-safe)."""
     try:
         params = {
             "api_key": SCRAPINGBEE_API_KEY,
@@ -114,11 +119,32 @@ def fetch_html_with_scrapingbee(url: str) -> Optional[str]:
         response = requests.get(SCRAPINGBEE_ENDPOINT, params=params, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             return response.text
-        else:
-            print(f"  ! ScrapingBee error {response.status_code}: {response.text[:120]}")
-            return None
+        print(f"  ! ScrapingBee error {response.status_code}: {response.text[:120]}")
+        return None
     except Exception as exc:
         print(f"  ! ScrapingBee request failed: {exc}")
+        return None
+
+def fetch_html_with_playwright(url: str) -> Optional[str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  ! Playwright not installed. Skipping.")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_default_timeout(REQUEST_TIMEOUT * 1000)
+            page.goto(url, wait_until="domcontentloaded")
+            time.sleep(random.uniform(6, 10))
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as exc:
+        print(f"  ! Playwright error: {exc}")
         return None
 
 def fetch_html_with_requests(url: str, session: requests.Session) -> Optional[str]:
@@ -147,6 +173,12 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
         if cards:
             print(f"  * Fallback: found {len(cards)} generic anchors.")
     if not cards:
+        for tag in soup.find_all("a", href=True):
+            if "/i/" in tag["href"]:
+                cards.append(tag)
+        if cards:
+            print(f"  * Ultimate fallback found {len(cards)} /i/ links.")
+    if not cards:
         print("  * No product cards detected after all selectors.")
 
     results: List[dict] = []
@@ -161,9 +193,7 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
             brand_tag = card.select_one("[data-test='product-brand']") or card.select_one("[data-test='brand-name']")
             brand = brand_tag.get_text(strip=True) if brand_tag else ""
             image_tag = card.select_one("img")
-            image_url = ""
-            if image_tag:
-                image_url = image_tag.get("src") or image_tag.get("data-src") or ""
+            image_url = image_tag.get("src") or image_tag.get("data-src") or "" if image_tag else ""
             if not title and not url:
                 continue
             results.append({
@@ -180,18 +210,28 @@ def parse_product_data(html: str, max_results: int = MAX_RESULTS_PER_ITEM) -> Li
     return results
 
 # ---------------------------------------------------------------------------
-# Core search logic
+# Core search logic with triple fallback
 # ---------------------------------------------------------------------------
 def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult]:
     query_url = SEARCH_URL_TEMPLATE.format(query=requests.utils.quote(item_name))
+    html = None
 
+    # 1️⃣ Try ScrapingBee first
     if USE_SCRAPINGBEE:
         html = fetch_html_with_scrapingbee(query_url)
-    else:
+
+    # 2️⃣ Fallback to Playwright
+    if not html:
+        print("  ! ScrapingBee failed — trying Playwright...")
+        html = fetch_html_with_playwright(query_url)
+
+    # 3️⃣ Final fallback to requests
+    if not html:
+        print("  ! Playwright failed — trying plain requests.")
         html = fetch_html_with_requests(query_url, session)
 
     if not html:
-        print(f"  ! Failed to retrieve results for '{item_name}'.")
+        print(f"  ❌ Failed to retrieve results for '{item_name}'.")
         return []
 
     raw_results = parse_product_data(html, max_results=MAX_RESULTS_PER_ITEM * 2)
@@ -228,7 +268,7 @@ def search_zoro(item_name: str, session: requests.Session) -> List[ProductResult
     return results
 
 # ---------------------------------------------------------------------------
-# Image handling
+# Image and Excel I/O
 # ---------------------------------------------------------------------------
 def download_image(image_url: str, target_dir: Path, base_name: str, session: requests.Session) -> str:
     if not image_url:
@@ -249,9 +289,6 @@ def download_image(image_url: str, target_dir: Path, base_name: str, session: re
             file_path.unlink(missing_ok=True)
         return ""
 
-# ---------------------------------------------------------------------------
-# Output helpers
-# ---------------------------------------------------------------------------
 def save_to_excel(results: Iterable[ProductResult], output_path: Path) -> None:
     rows = [{
         "Search Term": r.search_term,
@@ -289,7 +326,7 @@ def main() -> None:
     consecutive_failures = 0
 
     for item_name in items:
-        print(f"Searching for: {item_name}...")
+        print(f"\n🔎 Searching for: {item_name}...")
         results = search_zoro(item_name, session)
 
         if not results:
@@ -304,7 +341,6 @@ def main() -> None:
                 image_path="",
                 match_score=0,
             ))
-            print(f"No results found for '{item_name}'.")
             consecutive_failures += 1
         else:
             consecutive_failures = 0
@@ -312,12 +348,13 @@ def main() -> None:
                 base_name = "_".join(filter(None, [slugify(item_name), str(idx)]))
                 product.image_path = download_image(product.image_url, image_dir, base_name, session)
                 all_results.append(product)
-                print(f"  -> Found: {product.title} (Score: {product.match_score})")
+                print(f"  ✅ {product.title} ({product.match_score})")
+
                 if product.image_url:
                     time.sleep(random.uniform(2, 4))
 
         if consecutive_failures >= 3:
-            print("  ! Encountered 3 consecutive failed searches. Backing off for 60 seconds.")
+            print("⚠️  Encountered 3 failed searches. Pausing for 60 seconds...")
             time.sleep(60)
             consecutive_failures = 0
 
@@ -325,7 +362,7 @@ def main() -> None:
 
     try:
         save_to_excel(all_results, output_path)
-        print(f"Saved results to {output_path}")
+        print(f"\n💾 Saved results to {output_path}")
     except Exception as exc:
         print(f"Failed to save results: {exc}")
 
